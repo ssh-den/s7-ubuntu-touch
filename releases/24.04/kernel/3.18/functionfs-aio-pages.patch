@@ -1,0 +1,301 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+--- a/drivers/usb/gadget/function/f_fs.c
++++ b/drivers/usb/gadget/function/f_fs.c
+@@ -18,7 +18,9 @@
+ /* #define DEBUG */
+ /* #define VERBOSE_DEBUG */
+ 
++#include <linux/aio.h>
+ #include <linux/blkdev.h>
++#include <linux/highmem.h>
+ #include <linux/pagemap.h>
+ #include <linux/export.h>
+ #include <linux/hid.h>
+@@ -875,6 +877,275 @@
+ 	return ffs_epfile_io(file, buf, len, 1);
+ }
+ 
++#ifdef CONFIG_AIO
++/* AIO endpoint transport adapted from Android Common 3.18 FunctionFS.
++ * Keep Samsung's synchronous endpoint and ready-callback paths intact.
++ */
++struct ffs_read_span {
++	struct page *page;
++	unsigned int offset;
++	unsigned int length;
++};
++
++struct ffs_async_io {
++	struct work_struct work;
++	struct kiocb *iocb;
++	struct usb_ep *ep;
++	struct usb_request *request;
++	void *buffer;
++	size_t length;
++	struct ffs_read_span *spans;
++	size_t nr_spans;
++	bool cancelled;
++};
++
++static void ffs_async_free(struct ffs_async_io *io)
++{
++	size_t i;
++
++	for (i = 0; i < io->nr_spans; i++)
++		put_page(io->spans[i].page);
++	kfree(io->spans);
++	kfree(io->buffer);
++	kfree(io);
++}
++
++static int ffs_async_pin_read_pages(struct ffs_async_io *io,
++				   const struct iovec *iov,
++				   unsigned long nr_segs)
++{
++	size_t nr_spans = 0;
++	size_t remaining = io->length;
++	unsigned long i;
++
++	for (i = 0; i < nr_segs && remaining; i++) {
++		size_t count = min(remaining, iov[i].iov_len);
++
++		if (count)
++			nr_spans += DIV_ROUND_UP(offset_in_page(iov[i].iov_base) +
++						 count, PAGE_SIZE);
++		remaining -= count;
++	}
++	if (remaining)
++		return -EINVAL;
++
++	io->spans = kcalloc(nr_spans, sizeof(*io->spans), GFP_KERNEL);
++	if (!io->spans)
++		return -ENOMEM;
++
++	/* Resolve writable pages in the submitting task, including any COW.
++	 * The worker can then use kernel mappings without borrowing its mm.
++	 */
++	remaining = io->length;
++	for (i = 0; i < nr_segs && remaining; i++) {
++		unsigned long addr = (unsigned long)iov[i].iov_base;
++		size_t count = min(remaining, iov[i].iov_len);
++
++		remaining -= count;
++		while (count) {
++			struct ffs_read_span *span = &io->spans[io->nr_spans];
++			int pinned;
++
++			span->offset = offset_in_page(addr);
++			span->length = min_t(size_t, count, PAGE_SIZE - span->offset);
++			pinned = get_user_pages_fast(addr & PAGE_MASK, 1, 1, &span->page);
++			if (pinned != 1)
++				return pinned < 0 ? pinned : -EFAULT;
++			io->nr_spans++;
++			addr += span->length;
++			count -= span->length;
++		}
++	}
++	return 0;
++}
++
++static void ffs_async_copy_read(struct ffs_async_io *io, size_t length)
++{
++	size_t offset = 0;
++	size_t i;
++
++	for (i = 0; i < io->nr_spans && offset < length; i++) {
++		struct ffs_read_span *span = &io->spans[i];
++		size_t count = min_t(size_t, length - offset, span->length);
++		void *mapped = kmap(span->page);
++
++		memcpy(mapped + span->offset, io->buffer + offset, count);
++		kunmap(span->page);
++		flush_dcache_page(span->page);
++		set_page_dirty_lock(span->page);
++		offset += count;
++	}
++}
++
++static void ffs_async_copy_worker(struct work_struct *work)
++{
++	struct ffs_async_io *io = container_of(work, struct ffs_async_io, work);
++	struct kiocb *iocb = io->iocb;
++	struct ffs_epfile *epfile = iocb->ki_filp->private_data;
++	struct usb_request *request = io->request;
++	ssize_t result = request->status ? request->status : (ssize_t)request->actual;
++
++	if (io->nr_spans && result > 0) {
++		result = min_t(size_t, result, io->length);
++		ffs_async_copy_read(io, result);
++	}
++
++	spin_lock_irq(&epfile->ffs->eps_lock);
++	iocb->private = NULL;
++	usb_ep_free_request(io->ep, request);
++	spin_unlock_irq(&epfile->ffs->eps_lock);
++
++	ffs_async_free(io);
++	aio_complete(iocb, result, 0);
++}
++
++static void ffs_async_complete(struct usb_ep *ep, struct usb_request *request)
++{
++	struct ffs_async_io *io = request->context;
++
++	schedule_work(&io->work);
++}
++
++static int ffs_async_cancel(struct kiocb *iocb)
++{
++	struct ffs_epfile *epfile = iocb->ki_filp->private_data;
++	struct ffs_async_io *io;
++	unsigned long flags;
++	int result = -EINVAL;
++
++	spin_lock_irqsave(&epfile->ffs->eps_lock, flags);
++	io = iocb->private;
++	if (io) {
++		if (io->request)
++			result = usb_ep_dequeue(io->ep, io->request);
++		else {
++			io->cancelled = true;
++			result = 0;
++		}
++	}
++	spin_unlock_irqrestore(&epfile->ffs->eps_lock, flags);
++	return result;
++}
++
++static ssize_t ffs_epfile_aio(struct kiocb *iocb, const struct iovec *iov,
++			      unsigned long nr_segs, bool read)
++{
++	struct file *file = iocb->ki_filp;
++	struct ffs_epfile *epfile = file->private_data;
++	struct ffs_data *ffs = epfile->ffs;
++	struct ffs_ep *ep;
++	struct ffs_async_io *io;
++	size_t length = iocb->ki_nbytes;
++	size_t allocated = length;
++	size_t copied = 0;
++	unsigned long i;
++	int result;
++
++	if (!length)
++		return 0;
++	if (ffs->state != FFS_ACTIVE)
++		return -ENODEV;
++	if (!READ_ONCE(epfile->ep)) {
++		if (file->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++		result = wait_event_interruptible(epfile->wait, READ_ONCE(epfile->ep));
++		if (result)
++			return result;
++	}
++
++	spin_lock_irq(&ffs->eps_lock);
++	ep = epfile->ep;
++	if (!ep) {
++		spin_unlock_irq(&ffs->eps_lock);
++		return -ESHUTDOWN;
++	}
++	if (read == epfile->in) {
++		result = epfile->isoc ? -EINVAL : -EBADMSG;
++		if (!epfile->isoc)
++			usb_ep_set_halt(ep->ep);
++		spin_unlock_irq(&ffs->eps_lock);
++		return result;
++	}
++	if (read)
++		allocated = usb_ep_align_maybe(ffs->gadget, ep->ep, length);
++	spin_unlock_irq(&ffs->eps_lock);
++
++	io = kzalloc(sizeof(*io), GFP_KERNEL);
++	if (!io)
++		return -ENOMEM;
++	io->buffer = kmalloc(allocated, GFP_KERNEL);
++	if (!io->buffer) {
++		kfree(io);
++		return -ENOMEM;
++	}
++	INIT_WORK(&io->work, ffs_async_copy_worker);
++	io->iocb = iocb;
++	io->length = length;
++	if (read) {
++		result = ffs_async_pin_read_pages(io, iov, nr_segs);
++		if (result)
++			goto free_io;
++	} else {
++		for (i = 0; i < nr_segs && copied < length; i++) {
++			size_t count = min(length - copied, iov[i].iov_len);
++
++			if (copy_from_user(io->buffer + copied, iov[i].iov_base, count)) {
++				result = -EFAULT;
++				goto free_io;
++			}
++			copied += count;
++		}
++		allocated = copied;
++	}
++
++	iocb->private = io;
++	kiocb_set_cancel_fn(iocb, ffs_async_cancel);
++	spin_lock_irq(&ffs->eps_lock);
++	if (io->cancelled) {
++		result = -ECANCELED;
++		goto unlock;
++	}
++	if (epfile->ep != ep) {
++		result = -ESHUTDOWN;
++		goto unlock;
++	}
++	io->ep = ep->ep;
++	io->request = usb_ep_alloc_request(io->ep, GFP_ATOMIC);
++	if (!io->request) {
++		result = -ENOMEM;
++		goto unlock;
++	}
++	io->request->buf = io->buffer;
++	io->request->length = allocated;
++	io->request->context = io;
++	io->request->complete = ffs_async_complete;
++	result = usb_ep_queue(io->ep, io->request, GFP_ATOMIC);
++	if (!result) {
++		spin_unlock_irq(&ffs->eps_lock);
++		return -EIOCBQUEUED;
++	}
++	usb_ep_free_request(io->ep, io->request);
++unlock:
++	iocb->private = NULL;
++	spin_unlock_irq(&ffs->eps_lock);
++free_io:
++	ffs_async_free(io);
++	return result;
++}
++
++static ssize_t ffs_epfile_aio_read(struct kiocb *iocb, const struct iovec *iov,
++				   unsigned long nr_segs, loff_t offset)
++{
++	return ffs_epfile_aio(iocb, iov, nr_segs, true);
++}
++
++static ssize_t ffs_epfile_aio_write(struct kiocb *iocb, const struct iovec *iov,
++				    unsigned long nr_segs, loff_t offset)
++{
++	return ffs_epfile_aio(iocb, iov, nr_segs, false);
++}
++#endif
++
+ static int
+ ffs_epfile_open(struct inode *inode, struct file *file)
+ {
+@@ -959,6 +1230,10 @@
+ 	.open =		ffs_epfile_open,
+ 	.write =	ffs_epfile_write,
+ 	.read =		ffs_epfile_read,
++#ifdef CONFIG_AIO
++	.aio_write =	ffs_epfile_aio_write,
++	.aio_read =	ffs_epfile_aio_read,
++#endif
+ 	.release =	ffs_epfile_release,
+ 	.unlocked_ioctl =	ffs_epfile_ioctl,
+ };

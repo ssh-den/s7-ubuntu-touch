@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for option in "$@"; do
+    if [[ $option == -o || $option == --create ]]; then
+        LC_ALL=C sort | /usr/bin/cpio --reproducible --owner=0:0 "$@"
+        exit
+    fi
+done
+exec /usr/bin/cpio "$@"

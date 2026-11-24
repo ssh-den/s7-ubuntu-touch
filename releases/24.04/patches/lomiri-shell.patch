@@ -1,0 +1,171 @@
+SPDX-License-Identifier: GPL-3.0-only
+
+--- a/Shell.qml
++++ b/Shell.qml
+@@ -46,6 +46,8 @@
+ import Cursor 1.1
+ import WindowManager 1.0
+ import LomiriPanel 1.0
++import io.thp.pyotherside 1.3 as PyOtherSide
++import QtFeedback 5.0 as Feedback
+
+ StyledItem {
+     id: shell
+@@ -305,15 +307,154 @@
+
+     WindowInputFilter {
+         id: inputFilter
+-        Keys.onPressed: physicalKeysMapper.onKeyPressed(event, lastInputTimestamp);
+-        Keys.onReleased: physicalKeysMapper.onKeyReleased(event, lastInputTimestamp);
++        property bool backPressHandled: false
++        property bool showHomeOnRelease: false
++
++        function isHardwareHome(event) {
++            return event.nativeScanCode === 172 && event.key === Qt.Key_HomePage;
++        }
++
++        function isHardwareBack(event) {
++            return event.nativeScanCode === 158 && event.key === Qt.Key_Back;
++        }
++
++        Keys.onPressed: function(event) {
++            if (isHardwareHome(event)) {
++                if (!event.isAutoRepeat) {
++                    suppressHomeMonitor.restart();
++                    showHomeOnRelease = !!herolteNavigation.item && herolteNavigation.item.canNavigate;
++                }
++                event.accepted = true;
++                return;
++            }
++            if (isHardwareBack(event) &&
++                    herolteNavigation.item && herolteNavigation.item.canNavigate) {
++                if (!event.isAutoRepeat)
++                    backPressHandled = herolteNavigation.item.dismissOverlay();
++                if (backPressHandled) {
++                    event.accepted = true;
++                    return;
++                }
++            }
++            physicalKeysMapper.onKeyPressed(event, lastInputTimestamp);
++        }
++
++        Keys.onReleased: function(event) {
++            if (isHardwareHome(event)) {
++                if (!event.isAutoRepeat) {
++                    if (showHomeOnRelease && herolteNavigation.item && herolteNavigation.item.canNavigate)
++                        shell.showHome();
++                    showHomeOnRelease = false;
++                }
++                event.accepted = true;
++                return;
++            }
++            if (backPressHandled && isHardwareBack(event)) {
++                if (!event.isAutoRepeat)
++                    backPressHandled = false;
++                event.accepted = true;
++                return;
++            }
++            physicalKeysMapper.onKeyReleased(event, lastInputTimestamp);
++        }
++    }
++
++    Timer {
++        id: suppressHomeMonitor
++        // Suppress the duplicate Home action from the upstream monitor's 150 ms timer.
++        interval: 250
++    }
++
++    Loader {
++        id: herolteNavigation
++        active: shell.screenIndex === 0 && shell.mode !== "greeter"
++
++        sourceComponent: Item {
++            readonly property bool displayOn: Powerd.status !== Powerd.Off
++            readonly property bool canNavigate: displayOn && !greeter.active &&
++                !shell.waitingOnGreeter && !wizard.active && !dialogs.hasActiveDialog &&
++                !notifications.useModal && !screenshotEditor.visible
++            property bool navigationHelperReady: false
++
++            function dismissOverlay() {
++                if (!panel.indicators.fullyClosed) {
++                    panel.indicators.hide();
++                } else if (!panel.applicationMenus.fullyClosed) {
++                    panel.applicationMenus.hide();
++                } else if (launcher.drawerShown || (launcher.shown && !launcher.lockedVisible)) {
++                    launcher.hide();
++                } else if (stage.spreadShown) {
++                    stage.closeSpread();
++                } else {
++                    return false;
++                }
++                return true;
++            }
++
++            function lightButtons() {
++                if (!navigationHelperReady || !displayOn)
++                    return;
++                if (!keyLightTimer.running)
++                    buttons.call("herolte_navigation.set_light", [true]);
++                keyLightTimer.restart();
++            }
++
++            onDisplayOnChanged: {
++                if (displayOn) {
++                    lightButtons();
++                } else if (navigationHelperReady) {
++                    keyLightTimer.stop();
++                    buttons.call("herolte_navigation.set_light", [false]);
++                }
++            }
++
++            Timer {
++                id: keyLightTimer
++                interval: 3000
++                onTriggered: buttons.call("herolte_navigation.set_light", [false])
++            }
++
++            Feedback.HapticsEffect {
++                id: keyHaptics
++                duration: 35
++                intensity: 1.0
++            }
++
++            PyOtherSide.Python {
++                id: buttons
++                onError: function(message) { console.warn("Galaxy S7 navigation:", message); }
++                Component.onCompleted: {
++                    setHandler("herolte-navigation-error", function(message) {
++                        console.warn("Galaxy S7 navigation:", message);
++                    });
++                    setHandler("herolte-button", function(isRecent, isCapacitive) {
++                        lightButtons();
++                        if (!canNavigate)
++                            return;
++                        if (isCapacitive)
++                            keyHaptics.start();
++                        if (isRecent && stage.spreadEnabled) {
++                            if (stage.spreadShown)
++                                stage.closeSpread();
++                            else
++                                stage.openSpread();
++                        }
++                    });
++                    addImportPath(Qt.resolvedUrl("."));
++                    importModule("herolte_navigation", function(success) {
++                        if (success)
++                            call("herolte_navigation.start", [], function() { navigationHelperReady = true; });
++                    });
++                }
++            }
++        }
+     }
+
+     WindowInputMonitor {
+         objectName: "windowInputMonitor"
+         onHomeKeyActivated: {
+             // Ignore when greeter is active, to avoid pocket presses
+-            if (!greeter.active) {
++            if (!greeter.active && !suppressHomeMonitor.running) {
+                 launcher.toggleDrawer(/* focusInputField */  false,
+                                       /* onlyOpen */         false,
+                                       /* alsoToggleLauncher */ true);

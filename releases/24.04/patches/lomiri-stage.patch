@@ -1,0 +1,25 @@
+SPDX-License-Identifier: GPL-3.0-only
+
+--- a/Stage/Stage.qml
++++ b/Stage/Stage.qml
+@@ -175,6 +175,11 @@
+         priv.goneToSpread = false;
+     }
+
++    function openSpread() {
++        if (spreadEnabled)
++            priv.goneToSpread = true;
++    }
++
+     onSpreadEnabledChanged: {
+         if (!spreadEnabled && spreadShown) {
+             closeSpread();
+@@ -216,7 +221,7 @@
+         id: showSpreadShortcut
+         shortcut: Qt.MetaModifier|Qt.Key_W
+         active: root.spreadEnabled
+-        onTriggered: priv.goneToSpread = true
++        onTriggered: root.openSpread()
+     }
+
+     GlobalShortcut {
