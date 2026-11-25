@@ -1,0 +1,2 @@
+kernel_url=https://github.com/8890q/android_kernel_samsung_universal8890.git
+kernel_commit=dcadf09ba0cd4215c5e1ad4bff2bf6edc4f85db2

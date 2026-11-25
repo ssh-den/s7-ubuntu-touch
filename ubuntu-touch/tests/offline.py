@@ -1,13 +1,12 @@
-"""Validate release recipes offline using synthetic build inputs."""
-
+"""Check the release recipes without downloading inputs or building firmware."""
+from hashlib import sha256
+from io import BytesIO
 import os
+from pathlib import Path
 import runpy
 import subprocess
 import sys
 import tarfile
-from hashlib import sha256
-from io import BytesIO
-from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -18,7 +17,6 @@ from artifacts import sha, verify
 
 
 def layer(path, files):
-    """Create a synthetic system layer for offline testing."""
     with tarfile.open(path, "w:xz") as archive:
         for name, data in files.items():
             member = tarfile.TarInfo(f"system/{name}")
@@ -28,7 +26,6 @@ def layer(path, files):
 
 
 def run_release(work, version, render, make_image):
-    """Build a release from fixtures and verify its artifact checksums."""
     recipe = work / version / "system.py"
     recipe.parent.mkdir()
     recipe.write_text("fixture")
@@ -39,7 +36,6 @@ def run_release(work, version, render, make_image):
     output = work / f"out-{version}"
     argv = [str(recipe), str(inputs), str(work / "adaptation"), str(output)]
     with patch.object(sys, "argv", argv), patch.object(release, "make_ext4", make_image):
-        # Verify that an unchanged build reuses existing artifacts.
         for _ in range(2):
             release.build_release(recipe, version, 1, render)
     for line in (output / "SHA256SUMS").read_text().splitlines():
@@ -57,6 +53,7 @@ def main():
 
     focal = runpy.run_path(str(ROOT / "releases/20.04/system.py"))
     noble = runpy.run_path(str(ROOT / "releases/24.04/system.py"))
+    resolute = runpy.run_path(str(ROOT / "releases/26.04/system.py"))
     shell = "usr/share/lomiri/Shell.qml"
     stage = "usr/share/lomiri/Stage/Stage.qml"
     fake_patch = """--- old
@@ -80,33 +77,27 @@ def main():
         patch_file.write_text(fake_patch)
 
         renders = []
-
         def make_image(payload, image, size, filesystem_uuid):
-            """Validate the payload and simulate deterministic image creation."""
             with tarfile.open(payload) as archive:
                 names = archive.getnames()
                 renders.append(set(names))
-                if "etc/system-image/channel.ini" in renders[-1]:
+                if "usr/share/lomiri/herolte_navigation.py" in renders[-1]:
                     assert archive.extractfile(shell).read() == b"patched\n"
-                    for path in (
-                                "etc/system-image/config.d/01_channel.ini",
-                                "etc/systemd/user/pulseaudio.service.d/90-herolte-audio.conf"
-                    ):
-                        # Ensure parent directories precede their files in the archive.
+                    for path in ("etc/system-image/config.d/01_channel.ini",
+                                 "etc/systemd/user/pulseaudio.service.d/90-herolte-audio.conf"):
                         for parent in Path(path).parents:
                             if parent.parts:
                                 name = parent.as_posix()
                                 assert archive.getmember(name).isdir()
                                 assert names.index(name) < names.index(path)
+                if "usr/lib/os-release" in names:
+                    android = resolute["ANDROID_ROOTFS"]
+                    assert archive.extractfile(android).read() == b"gsi resized"
             image.write_bytes(sha256(payload.read_bytes() + filesystem_uuid.bytes).digest())
 
         run_release(work, "20.04", focal["render"], make_image)
         assert len(renders) == 1 and "etc/focal-version" in renders[-1]
-
-        # Remove the Focal-specific version layer before testing Noble.
         (inputs / "version-test.tar.xz").unlink()
-
-        # Use synthetic patches to test the Noble patching workflow.
         with patch.dict(noble["render"].__globals__, PATCHES={shell: patch_file, stage: patch_file}):
             run_release(work, "24.04", noble["render"], make_image)
         assert len(renders) == 2
@@ -118,6 +109,20 @@ def main():
             "var/lib/lxc/android/android-rootfs.img",
         } <= renders[-1]
         assert "etc/focal-version" not in renders[-1]
+
+        layer(inputs / "rootfs-test.tar.xz", {"usr/lib/os-release": b'VERSION_ID="26.04"\n'})
+        layer(adaptation / "device_herolte.tar.xz", {"vendor.img": b"vendor"})
+
+        def resize_fixture(path):
+            path.write_bytes(path.read_bytes() + b" resized")
+
+        with patch.dict(resolute["render"].__globals__, resize_android_rootfs=resize_fixture):
+            run_release(work, "26.04", resolute["render"], make_image)
+        assert len(renders) == 3
+        assert {
+            "usr/lib/os-release", "vendor.img", "var/lib/lxc/android/android-rootfs.img",
+            "etc/system-image/channel.ini", "etc/system-image/config.d/01_channel.ini",
+        } <= renders[-1]
     print("Offline release checks passed.")
 
 

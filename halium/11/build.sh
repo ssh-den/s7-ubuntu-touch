@@ -1,4 +1,8 @@
 build_adaptation() {
+    if [[ $kernel == 4.4 ]]; then
+        build_adaptation_4_4
+        return
+    fi
     local port_checkout=$scratch/port kernel_src=$scratch/kernel adaptation_dir=$scratch/adaptation
     local halium_output_dir=$scratch/halium cache_dir=$scratch/objects/downloads
     local name url commit compiler wrapper patch_file compiled_defconfig
@@ -43,4 +47,39 @@ build_adaptation() {
     fi
     tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
         -C "$tree" -cf - system | xz --threads=1 > "$adaptation_dir/device_herolte.tar.xz"
+}
+
+build_adaptation_4_4() {
+    source "$kernel_dir/build.sh"
+    build_kernel
+
+    local port_checkout=$scratch/port-4.4
+    local stage=$scratch/adaptation-4.4
+    local boot_work=$scratch/boot-4.4
+    rm -rf "$port_checkout" "$stage" "$boot_work"
+    checkout_git "$port_commit" "$port_checkout"
+    checkout_git "$tools_commit" "$port_checkout/build"
+    mkdir -p "$stage" "$boot_work"
+    cp "$cache/halium-boot-ramdisk.img" "$boot_work/"
+
+    (
+        cd "$port_checkout"
+        bash ./prepare_overlays.sh herolte
+        cat >> deviceinfo <<'DEVICEINFO'
+deviceinfo_bootimg_prebuilt_dt=""
+deviceinfo_bootimg_dt="dtb.img"
+deviceinfo_has_recovery_partition="false"
+DEVICEINFO
+        find ramdisk-overlay -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+        export PATH="$port_checkout/mkbootimg_modified:$root/build/bin:$PATH"
+        bash build/make-bootimage.sh "$boot_work" "$scratch/kernel-objects" \
+            "$boot_work/halium-boot-ramdisk.img" "$stage/boot.img"
+        [[ $(stat -c %s "$stage/boot.img") -le 41943040 ]] ||
+            die "boot.img exceeds the herolte boot partition."
+        tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -C overlay -cf - system | xz --threads=1 > "$stage/device_herolte.tar.xz"
+    )
+
+    rm -rf "$scratch/adaptation"
+    mv "$stage" "$scratch/adaptation"
 }

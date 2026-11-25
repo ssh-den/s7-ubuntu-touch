@@ -12,12 +12,17 @@ release_dir=$root/releases/$release
 kernel_dir=$root/kernel/$kernel
 [[ -f $release_dir/profile.sh ]] || die "Unknown release: $release"
 [[ -f $kernel_dir/profile.sh ]] || die "Unknown kernel series: $kernel"
+[[ $kernel != 4.4 || $release == 26.04 ]] || die "Kernel 4.4 is available for release 26.04."
+boot_console=${S7_BOOT_CONSOLE:-0}
+[[ $boot_console == 0 || ( $boot_console == 1 && $kernel == 4.4 ) ]] ||
+    die "S7_BOOT_CONSOLE=1 requires the Linux 4.4 profile."
 
 mkdir -p "$work"
 work=$(cd "$work" && pwd -P)
 cache=$work/inputs
 scratch=$work/build/$release/$kernel
 output=$work/out/$release/$kernel
+[[ $boot_console == 0 ]] || output+=-console
 export LC_ALL=C.UTF-8 TZ=UTC SOURCE_DATE_EPOCH=1795392000
 export KBUILD_BUILD_TIMESTAMP='Mon Nov 23 00:00:00 UTC 2026'
 export KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=s7-builder KBUILD_BUILD_VERSION=1
@@ -34,20 +39,26 @@ fetch_sources() {
     fetch_git "$port_url" "$port_commit"
     fetch_git "$tools_url" "$tools_commit"
     fetch_git "$kernel_url" "$kernel_commit"
-    while read -r name url commit; do
-        fetch_git "$url" "$commit"
-    done < "$halium_dir/tools.git"
+    if [[ $kernel == 3.18 ]]; then
+        while read -r name url commit; do
+            fetch_git "$url" "$commit"
+        done < "$halium_dir/tools.git"
+    fi
     fetch_files "$halium_dir/files.sha256"
     fetch_files "$release_dir/files.sha256"
 }
 
-build_firmware() {
+lock_build_inputs() {
     mkdir -p "$scratch"
     exec 8>"$scratch/.lock"
     flock -x 8
     [[ -f $cache/.lock ]] || die "Run make fetch RELEASE=$release first."
     exec 9<"$cache/.lock"
     flock -s 9
+}
+
+build_firmware() {
+    lock_build_inputs
     verify_files "$halium_dir/files.sha256"
     verify_files "$release_dir/files.sha256"
     source "$halium_dir/build.sh"

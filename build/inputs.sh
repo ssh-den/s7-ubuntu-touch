@@ -14,13 +14,17 @@ fetch_git() {
 }
 
 checkout_git() {
-    local commit=$1 destination=$2 repo
+    local commit=$1 destination=$2 ignored_submodule=${3:-} repo submodules
     repo=$(git_cache "$commit")
     [[ -d $repo ]] || die "Missing Git input $commit. Run make fetch RELEASE=$release."
     git -c core.autocrlf=false clone --quiet --shared --no-checkout "$repo" "$destination"
+    local objects=$destination/.git/objects
+    realpath --relative-to="$objects" "$repo/objects" > "$objects/info/alternates"
     git -C "$destination" -c core.autocrlf=false checkout --quiet --detach "$commit"
     if [[ -f $destination/.gitmodules ]]; then
-        die "Record submodule sources explicitly for $commit."
+        submodules=$(git -C "$destination" ls-files --stage | awk '$1 == 160000 {print $4}')
+        [[ -n $ignored_submodule && $submodules == "$ignored_submodule" ]] ||
+            die "Record submodule sources explicitly for $commit."
     fi
 }
 

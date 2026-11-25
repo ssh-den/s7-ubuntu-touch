@@ -3,12 +3,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 usage() {
-    printf 'Usage: ./s7 {fetch|build} RELEASE\n'
+    printf 'Usage: ./s7 {fetch|kernel|build} RELEASE\n'
+    printf '       ./s7 twrp --help\n'
 }
 
 case "${1:-}" in
     -h|--help) usage; exit 0 ;;
-    fetch|build) ;;
+    twrp) shift; exec python3 -IB device/twrp.py "$@" ;;
+    fetch|kernel|build) ;;
     *) usage >&2; exit 2 ;;
 esac
 if [[ $# != 2 || ! $2 =~ ^[0-9]+\.[0-9]+$ ]]; then
@@ -26,5 +28,11 @@ source "$root/halium/$halium/profile.sh"
 
 case "$operation" in
     fetch) fetch_sources ;;
+    kernel)
+        [[ $kernel == 4.4 ]] || die "The standalone kernel target requires KERNEL=4.4."
+        lock_build_inputs
+        source "$kernel_dir/build.sh"
+        build_kernel
+        ;;
     build) build_firmware ;;
 esac

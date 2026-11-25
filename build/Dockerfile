@@ -7,5 +7,5 @@ RUN rm /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         bc bison build-essential ca-certificates cpio curl e2fsprogs fakeroot file flex \
-        gawk git kmod libelf-dev libssl-dev patch python-is-python3 python3 rsync xz-utils zlib1g-dev \
+        gawk gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf git kmod libelf-dev libssl-dev patch python-is-python3 python3 rsync xz-utils zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*

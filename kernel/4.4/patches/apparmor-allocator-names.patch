@@ -1,0 +1,42 @@
+diff --git a/security/apparmor/include/apparmor.h b/security/apparmor/include/apparmor.h
+--- a/security/apparmor/include/apparmor.h
++++ b/security/apparmor/include/apparmor.h
+@@ -67,12 +67,12 @@
+ void aa_info_message(const char *str);
+ void *__aa_kvmalloc(size_t size, gfp_t flags);
+ 
+-static inline void *kvmalloc(size_t size)
++static inline void *aa_kvmalloc(size_t size)
+ {
+ 	return __aa_kvmalloc(size, 0);
+ }
+ 
+-static inline void *kvzalloc(size_t size)
++static inline void *aa_kvzalloc(size_t size)
+ {
+ 	return __aa_kvmalloc(size, __GFP_ZERO);
+ }
+diff --git a/security/apparmor/apparmorfs.c b/security/apparmor/apparmorfs.c
+--- a/security/apparmor/apparmorfs.c
++++ b/security/apparmor/apparmorfs.c
+@@ -100,7 +100,7 @@
+ 		return ERR_PTR(-EACCES);
+ 
+ 	/* freed by caller to simple_write_to_buffer */
+-	data = kvmalloc(alloc_size);
++	data = aa_kvmalloc(alloc_size);
+ 	if (data == NULL)
+ 		return ERR_PTR(-ENOMEM);
+ 
+diff --git a/security/apparmor/match.c b/security/apparmor/match.c
+--- a/security/apparmor/match.c
++++ b/security/apparmor/match.c
+@@ -59,7 +59,7 @@
+ 	if (bsize < tsize)
+ 		goto out;
+ 
+-	table = kvzalloc(tsize);
++	table = aa_kvzalloc(tsize);
+ 	if (table) {
+ 		*table = th;
+ 		if (th.td_flags == YYTD_DATA8)

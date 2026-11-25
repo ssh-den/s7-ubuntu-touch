@@ -1,0 +1,17 @@
+diff --git a/fs/file.c b/fs/file.c
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -742,6 +742,13 @@ static inline void __range_cloexec(struct files_struct *cur_fds,
+ static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
+ 				 unsigned int max_fd)
+ {
++	/* Userspace can use UINT_MAX to close all remaining descriptors.
++	 * Limit the loop to the fdtable so the increment cannot wrap.
++	 */
++	rcu_read_lock();
++	max_fd = min(max_fd, last_fd(files_fdtable(cur_fds)));
++	rcu_read_unlock();
++
+ 	while (fd <= max_fd) {
+ 		struct file *file;
+ 

@@ -1,9 +1,11 @@
 """Shared Halium OTA layer handling and ext4 image creation."""
 import io
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import os
+import shutil
 import subprocess
 import tarfile
+from tempfile import TemporaryDirectory
 
 
 EXT4_FEATURES = (
@@ -30,7 +32,7 @@ def system_path(name):
     return relative
 
 
-def add_layer(archive, source, transforms=None):
+def add_layer(archive, source, transforms=None, file_transforms=None):
     """Copy a layer, removing applied transforms so the caller can detect missing files."""
     print(f"SYSTEM: {source.name}", flush=True)
     command = ["xz", "-T0", "-dc", "--", source]
@@ -55,6 +57,19 @@ def add_layer(archive, source, transforms=None):
                     }
                     member.type = tarfile.REGTYPE
                     member.sparse = None
+                if file_transforms and name in file_transforms:
+                    if contents is None:
+                        raise ValueError(f"Expected a regular file in the OTA: {name}")
+                    with TemporaryDirectory() as folder:
+                        path = Path(folder) / "payload"
+                        with path.open("wb") as stream:
+                            shutil.copyfileobj(contents, stream, 1024 * 1024)
+                        file_transforms.pop(name)(path)
+                        member.size = path.stat().st_size
+                        member.pax_headers.pop("size", None)
+                        with path.open("rb") as stream:
+                            archive.addfile(member, stream)
+                    continue
                 if transforms and name in transforms:
                     if contents is None:
                         raise ValueError(f"Expected a regular file in the OTA: {name}")
